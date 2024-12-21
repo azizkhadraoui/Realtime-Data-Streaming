@@ -3,6 +3,7 @@ from datetime import datetime
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 import json
+import requests
 
 
 default_args = {
@@ -10,47 +11,37 @@ default_args = {
     'start_date': datetime(2023, 9, 3, 10, 00)
 }
 
+# Fetch data from the Go API endpoint
 def get_data():
-    import requests
+    res = requests.get("http://localhost:8085/data")  # Your Go API endpoint
+    if res.status_code == 200:
+        return res.json()  # Return the list of data from the API
+    else:
+        raise Exception(f"Failed to fetch data from the API. Status code: {res.status_code}")
 
-    res = requests.get("https://randomuser.me/api/")
-    res = res.json()
-    res = res['results'][0]
-
-    return res
-
-
+# Format the fetched data to include lesson_id, user_id, and geolocation
 def format_data(res):
-    data = {}
-    location = res['location']
-    data['id'] = uuid.uuid4()
-    data['first_name'] = res['name']['first']
-    data['last_name'] = res['name']['last']
-    data['gender'] = res['gender']
-    data['address'] = f"{str(location['street']['number'])} {location['street']['name']}, " \
-                      f"{location['city']}, {location['state']}, {location['country']}"
-    data['post_code'] = location['postcode']
-    data['email'] = res['email']
-    data['username'] = res['login']['username']
-    data['dob'] = res['dob']['date']
-    data['registered_date'] = res['registered']['date']
-    data['phone'] = res['phone']
-    data['picture'] = res['picture']['medium']
+    formatted_data = []
+    for item in res:
+        data = {}
+        # Assuming each item in res contains 'name', 'value', and other necessary information
+        data['lesson_id'] = uuid.uuid4()  # Generate a unique lesson_id
+        data['user_id'] = uuid.uuid4()    # Generate a unique user_id
+        data['geolocation'] = item.get('geolocation', 'Unknown location')  # Extract geolocation or use a default
+        
+        # Add other fields if necessary
+        formatted_data.append(data)
 
-    return data
+    return formatted_data
 
-
-
-
+# Ensure UUID is serializable
 def uuid_default(obj):
     if isinstance(obj, uuid.UUID):
         return str(obj)  # Convert UUID to string
     raise TypeError(f"Object of type {obj.__class__.__name__} is not serializable")
 
-
-
+# Stream the formatted data to a Kafka topic
 def stream_data():
-    import json
     from kafka import KafkaProducer
     import time
     import logging
@@ -59,18 +50,21 @@ def stream_data():
     curr_time = time.time()
 
     while True:
-        if time.time() > curr_time + 60: #1 minute
+        if time.time() > curr_time + 60:  # 1 minute
             break
         try:
-            res = get_data()  # Assuming get_data() is defined somewhere
-            res = format_data(res)  # Assuming format_data() is defined somewhere
-            json_data = json.dumps(res, default=uuid_default)  # Use the uuid_default function
+            res = get_data()  # Fetch the data from the Go API
+            formatted_data = format_data(res)  # Format it to include lesson_id, user_id, and geolocation
+            for data in formatted_data:
+                json_data = json.dumps(data, default=uuid_default)  # Serialize UUIDs
 
-            producer.send('users_created', json_data.encode('utf-8'))
+                # Send the data to Kafka
+                producer.send('users_created', json_data.encode('utf-8'))
         except Exception as e:
-            logging.error(f'An error occured: {e}')
+            logging.error(f'An error occurred: {e}')
             continue
 
+# Define the DAG
 with DAG('user_automation',
          default_args=default_args,
          schedule_interval='@daily',
@@ -80,4 +74,3 @@ with DAG('user_automation',
         task_id='stream_data_from_api',
         python_callable=stream_data
     )
-

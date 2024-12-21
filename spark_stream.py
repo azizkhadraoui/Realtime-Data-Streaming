@@ -2,10 +2,28 @@ import logging
 import uuid
 from cassandra.cluster import Cluster
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col
-from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.functions import from_json, col, lit, udf
+from pyspark.sql.types import StructType, StructField, StringType, FloatType
+import math
 
 logging.basicConfig(level=logging.INFO)
+
+# Haversine formula to calculate distance between two lat/lon points
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371000  # Earth radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+
+    a = math.sin(delta_phi / 2) * math.sin(delta_phi / 2) + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) * math.sin(delta_lambda / 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    distance = R * c  # in meters
+    return distance
+
+# Register the UDF for geospatial filtering
+haversine_udf = udf(haversine, FloatType())
 
 def create_keyspace(session):
     try:
@@ -31,7 +49,11 @@ def create_table(session):
             username TEXT,
             registered_date TEXT,
             phone TEXT,
-            picture TEXT);
+            picture TEXT,
+            lesson_id UUID,
+            user_id UUID,
+            latitude FLOAT,
+            longitude FLOAT);
         """)
         logging.info("Table created successfully!")
     except Exception as e:
@@ -87,7 +109,11 @@ def create_selection_df_from_kafka(spark_df):
         StructField("username", StringType(), False),
         StructField("registered_date", StringType(), False),
         StructField("phone", StringType(), False),
-        StructField("picture", StringType(), False)
+        StructField("picture", StringType(), False),
+        StructField("lesson_id", StringType(), False),
+        StructField("user_id", StringType(), False),
+        StructField("latitude", FloatType(), False),
+        StructField("longitude", FloatType(), False)
     ])
 
     try:
@@ -97,6 +123,14 @@ def create_selection_df_from_kafka(spark_df):
     except Exception as e:
         logging.error(f"Error creating selection DataFrame: {e}")
         return None
+
+def filter_nearby_points(df):
+    # Filter out points that are too close to others with the same lesson_id and user_id
+    window_spec = Window.partitionBy("lesson_id", "user_id")
+    df_with_distance = df.withColumn("distance", haversine_udf(col("latitude"), col("longitude"), col("latitude"), col("longitude")))
+
+    # Apply the condition to filter points with distance < 5 meters
+    return df_with_distance.filter(col("distance") >= 5)
 
 def main():
     # Create spark connection
@@ -120,7 +154,11 @@ def main():
 
                     logging.info("Streaming is being started...")
 
-                    streaming_query = (selection_df.writeStream
+                    # Process the data: remove close points
+                    processed_df = filter_nearby_points(selection_df)
+
+                    # Write the processed data to Cassandra
+                    streaming_query = (processed_df.writeStream
                                        .format("org.apache.spark.sql.cassandra")
                                        .option('checkpointLocation', '/tmp/checkpoint')
                                        .option('keyspace', 'spark_streams')
